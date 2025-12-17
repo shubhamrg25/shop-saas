@@ -1,17 +1,34 @@
 from django.db import models
 
+
 class Product(models.Model):
     name = models.CharField(max_length=200)
     purchase_price = models.FloatField()
     selling_price = models.FloatField()
-    stock = models.IntegerField(default=0)
+    stock = models.IntegerField()
     gst_percent = models.FloatField(default=0)
 
     def __str__(self):
         return self.name
 
+
+class Customer(models.Model):
+    name = models.CharField(max_length=200)
+    mobile = models.CharField(max_length=15, blank=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.mobile})"
+
+
 class Sale(models.Model):
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True
+    )
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
+
     quantity = models.IntegerField()
 
     total_amount = models.FloatField()
@@ -19,10 +36,11 @@ class Sale(models.Model):
     due_amount = models.FloatField()
 
     profit = models.FloatField()
+
     payment_status = models.CharField(max_length=10)  # PAID / DUE
     due_date = models.DateField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.product.name} - {self.payment_status}"
+        return f"Sale #{self.id} - {self.product.name}"

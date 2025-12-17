@@ -1,3 +1,4 @@
+import BillHistory from "./pages/BillHistory";
 import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import Billing from "./pages/Billing";
@@ -14,6 +15,7 @@ function App() {
 
       <div style={{ padding: "20px" }}>
         <Routes>
+          <Route path="/bills" element={<BillHistory />} />
           <Route path="/" element={<Dashboard />} />
           <Route path="/billing" element={<Billing />} />
           <Route path="/products" element={<Products />} />
