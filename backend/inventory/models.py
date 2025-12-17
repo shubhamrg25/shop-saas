@@ -9,3 +9,15 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
+
+class Sale(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.IntegerField()
+    selling_price = models.FloatField()
+    purchase_price = models.FloatField()
+    total_amount = models.FloatField()
+    profit = models.FloatField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.product.name} - {self.quantity}"
