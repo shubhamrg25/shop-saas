@@ -13,11 +13,16 @@ class Product(models.Model):
 class Sale(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
     quantity = models.IntegerField()
-    selling_price = models.FloatField()
-    purchase_price = models.FloatField()
+
     total_amount = models.FloatField()
+    paid_amount = models.FloatField()
+    due_amount = models.FloatField()
+
     profit = models.FloatField()
+    payment_status = models.CharField(max_length=10)  # PAID / DUE
+    due_date = models.DateField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.product.name} - {self.quantity}"
+        return f"{self.product.name} - {self.payment_status}"
