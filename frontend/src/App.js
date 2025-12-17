@@ -1,43 +1,26 @@
+import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
+import Dashboard from "./pages/Dashboard";
+import Billing from "./pages/Billing";
+import Products from "./pages/Products";
+
 function App() {
   return (
-    <div style={{ padding: "20px", fontFamily: "Arial" }}>
-      <h1>Shop SaaS Dashboard</h1>
+    <BrowserRouter>
+      <nav style={{ padding: "10px", background: "#eee" }}>
+        <Link to="/" style={{ marginRight: "10px" }}>Dashboard</Link>
+        <Link to="/billing" style={{ marginRight: "10px" }}>Billing</Link>
+        <Link to="/products">Products</Link>
+      </nav>
 
-      <div style={{ display: "flex", gap: "20px", marginTop: "20px" }}>
-        <div style={cardStyle}>
-          <h3>Today's Sales</h3>
-          <p>₹ 0</p>
-        </div>
-
-        <div style={cardStyle}>
-          <h3>Today's Profit</h3>
-          <p>₹ 0</p>
-        </div>
-
-        <div style={cardStyle}>
-          <h3>Products</h3>
-          <p>0 Items</p>
-        </div>
+      <div style={{ padding: "20px" }}>
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/billing" element={<Billing />} />
+          <Route path="/products" element={<Products />} />
+        </Routes>
       </div>
-
-      <div style={{ marginTop: "30px" }}>
-        <button style={btnStyle}>Create Bill</button>
-        <button style={btnStyle}>View Products</button>
-      </div>
-    </div>
+    </BrowserRouter>
   );
 }
-
-const cardStyle = {
-  border: "1px solid #ccc",
-  padding: "15px",
-  width: "200px",
-  borderRadius: "5px",
-};
-
-const btnStyle = {
-  marginRight: "10px",
-  padding: "10px 15px",
-};
 
 export default App;
