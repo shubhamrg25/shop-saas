@@ -48,9 +48,10 @@ def create_bill(request):
     items = data.get("items", [])
     paid_amount = Decimal(str(data.get("paid_amount", "0")))
 
-    if not items:
+    if not items or not isinstance(items, list):
         return Response({"error": "Items required"}, status=400)
 
+    # CUSTOMER
     customer = None
     if customer_name or customer_mobile:
         customer, _ = Customer.objects.get_or_create(
@@ -59,27 +60,35 @@ def create_bill(request):
             defaults={"name": customer_name or "Customer"}
         )
 
+    # BILL HEADER
     bill = Bill.objects.create(
         shop=shop,
         customer=customer,
-        total_amount=0,
+        total_amount=Decimal("0"),
         paid_amount=paid_amount,
-        due_amount=0,
+        due_amount=Decimal("0"),
     )
 
     total = Decimal("0")
 
+    # ITEMS
     for item in items:
-        product = Product.objects.select_for_update().get(
-            id=item["product_id"], shop=shop
-        )
+        try:
+            product = Product.objects.select_for_update().get(
+                id=item["product_id"], shop=shop
+            )
+        except Product.DoesNotExist:
+            return Response({"error": "Product not found"}, status=404)
 
         qty = Decimal(str(item["quantity"]))
         if qty <= 0:
             return Response({"error": "Invalid quantity"}, status=400)
 
         if product.stock < qty:
-            return Response({"error": f"Insufficient stock for {product.name}"}, status=400)
+            return Response(
+                {"error": f"Insufficient stock for {product.name}"},
+                status=400
+            )
 
         rate = product.selling_price
         line_total = qty * rate
@@ -123,7 +132,12 @@ def pay_bill_due(request, bill_id):
     if amount <= 0:
         return Response({"error": "Invalid amount"}, status=400)
 
-    bill = Bill.objects.select_for_update().get(id=bill_id, shop=shop)
+    try:
+        bill = Bill.objects.select_for_update().get(
+            id=bill_id, shop=shop
+        )
+    except Bill.DoesNotExist:
+        return Response({"error": "Bill not found"}, status=404)
 
     if bill.due_amount <= 0:
         return Response({"error": "Bill already cleared"}, status=400)
@@ -154,12 +168,12 @@ def dashboard_stats(request):
     total_sales = Bill.objects.filter(
         shop=shop,
         created_at__date=today
-    ).aggregate(Sum("total_amount"))["total_amount__sum"] or 0
+    ).aggregate(Sum("total_amount"))["total_amount__sum"] or Decimal("0")
 
     total_due = Bill.objects.filter(
         shop=shop,
         due_amount__gt=0
-    ).aggregate(Sum("due_amount"))["due_amount__sum"] or 0
+    ).aggregate(Sum("due_amount"))["due_amount__sum"] or Decimal("0")
 
     return Response({
         "total_sales": str(total_sales),
@@ -168,13 +182,13 @@ def dashboard_stats(request):
 
 
 # =================================================
-# BILL HISTORY (SEARCH: BILL / CUSTOMER / MOBILE)
+# BILL HISTORY (SEARCH)
 # =================================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def bill_history(request):
     shop = request.user.shop
-    search = request.GET.get("search", "")
+    search = request.GET.get("search", "").strip()
     page_no = request.GET.get("page", 1)
 
     bills = Bill.objects.filter(shop=shop).select_related("customer")
@@ -204,6 +218,7 @@ def bill_history(request):
             for b in page
         ],
         "total_pages": paginator.num_pages,
+        "current_page": page.number,
     })
 
 
@@ -214,7 +229,7 @@ def bill_history(request):
 @permission_classes([IsAuthenticated])
 def customer_ledger(request):
     shop = request.user.shop
-    search = request.GET.get("search", "")
+    search = request.GET.get("search", "").strip()
 
     customers = Customer.objects.filter(shop=shop)
     if search:
@@ -225,8 +240,14 @@ def customer_ledger(request):
 
     result = []
     for c in customers:
-        bills = Bill.objects.filter(shop=shop, customer=c)
-        total_due = bills.aggregate(Sum("due_amount"))["due_amount__sum"] or 0
+        bills = Bill.objects.filter(
+            shop=shop,
+            customer=c
+        ).order_by("-created_at")
+
+        total_due = bills.aggregate(
+            Sum("due_amount")
+        )["due_amount__sum"] or Decimal("0")
 
         result.append({
             "customer_id": c.id,
@@ -255,10 +276,20 @@ def customer_ledger(request):
 @permission_classes([IsAuthenticated])
 def customer_statement(request, customer_id):
     shop = request.user.shop
-    customer = Customer.objects.get(id=customer_id, shop=shop)
 
-    bills = Bill.objects.filter(customer=customer, shop=shop)
-    total_due = bills.aggregate(Sum("due_amount"))["due_amount__sum"] or 0
+    try:
+        customer = Customer.objects.get(id=customer_id, shop=shop)
+    except Customer.DoesNotExist:
+        return Response({"error": "Customer not found"}, status=404)
+
+    bills = Bill.objects.filter(
+        customer=customer,
+        shop=shop
+    ).order_by("created_at")
+
+    total_due = bills.aggregate(
+        Sum("due_amount")
+    )["due_amount__sum"] or Decimal("0")
 
     return Response({
         "customer_id": customer.id,
@@ -285,7 +316,15 @@ def customer_statement(request, customer_id):
 @permission_classes([IsAuthenticated])
 def get_bill(request, bill_id):
     shop = request.user.shop
-    bill = Bill.objects.get(id=bill_id, shop=shop)
+
+    try:
+        bill = Bill.objects.select_related(
+            "customer", "shop"
+        ).prefetch_related("items__product").get(
+            id=bill_id, shop=shop
+        )
+    except Bill.DoesNotExist:
+        return Response({"error": "Bill not found"}, status=404)
 
     return Response({
         "id": bill.id,
