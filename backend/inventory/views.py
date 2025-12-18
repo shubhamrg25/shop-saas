@@ -1,172 +1,309 @@
-from rest_framework.decorators import api_view
+from decimal import Decimal
+from django.db import transaction
+from django.db.models import Sum, Q
+from django.utils.timezone import now
+from django.core.paginator import Paginator
+
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from django.db.models import Sum, Q
-from django.core.paginator import Paginator
-from django.utils.timezone import now
-
-from .models import Product, Sale, Customer
+from .models import Product, Customer, Bill, BillItem
 
 
-# -------------------------------------------------
+# =================================================
 # PRODUCTS LIST
-# -------------------------------------------------
-@api_view(['GET'])
+# =================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def product_list(request):
-    products = Product.objects.all()
-    data = []
+    shop = request.user.shop
+    products = Product.objects.filter(shop=shop)
 
-    for p in products:
-        data.append({
+    return Response([
+        {
             "id": p.id,
             "name": p.name,
-            "selling_price": p.selling_price,
-            "stock": p.stock,
-            "gst_percent": p.gst_percent
-        })
+            "unit": p.unit,
+            "selling_price": str(p.selling_price),
+            "stock": str(p.stock),
+        }
+        for p in products
+    ])
 
-    return Response(data)
 
+# =================================================
+# CREATE BILL
+# =================================================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def create_bill(request):
+    shop = request.user.shop
+    data = request.data
 
-# -------------------------------------------------
-# CREATE SALE (BILLING)
-# -------------------------------------------------
-@api_view(['POST'])
-def create_sale(request):
-    try:
-        product_id = int(request.data.get("product_id"))
-        quantity = int(request.data.get("quantity"))
-        paid_amount = float(request.data.get("paid_amount", 0))
+    customer_name = (data.get("customer_name") or "").strip()
+    customer_mobile = (data.get("customer_mobile") or "").strip()
+    items = data.get("items", [])
+    paid_amount = Decimal(str(data.get("paid_amount", "0")))
 
-        customer_name = request.data.get("customer_name")
-        customer_mobile = request.data.get("customer_mobile")
-        due_date = request.data.get("due_date")
-    except Exception:
-        return Response({"error": "Invalid input"}, status=400)
+    if not items:
+        return Response({"error": "Items required"}, status=400)
 
-    # Product
-    try:
-        product = Product.objects.get(id=product_id)
-    except Product.DoesNotExist:
-        return Response({"error": "Product not found"}, status=404)
-
-    if product.stock < quantity:
-        return Response({"error": "Insufficient stock"}, status=400)
-
-    # Customer (create or fetch)
     customer = None
-    if customer_name:
+    if customer_name or customer_mobile:
         customer, _ = Customer.objects.get_or_create(
-            name=customer_name.strip(),
-            mobile=customer_mobile.strip() if customer_mobile else ""
+            shop=shop,
+            mobile=customer_mobile,
+            defaults={"name": customer_name or "Customer"}
         )
 
-    # Calculations
-    total_amount = product.selling_price * quantity
-    profit = (product.selling_price - product.purchase_price) * quantity
-    due_amount = total_amount - paid_amount
-    payment_status = "PAID" if due_amount <= 0 else "DUE"
-
-    # Update stock
-    product.stock -= quantity
-    product.save()
-
-    # Create sale
-    Sale.objects.create(
+    bill = Bill.objects.create(
+        shop=shop,
         customer=customer,
-        product=product,
-        quantity=quantity,
-        total_amount=total_amount,
+        total_amount=0,
         paid_amount=paid_amount,
-        due_amount=due_amount,
-        profit=profit,
-        payment_status=payment_status,
-        due_date=due_date if payment_status == "DUE" else None,
+        due_amount=0,
     )
 
-    return Response(
-        {
-            "total_amount": total_amount,
-            "paid_amount": paid_amount,
-            "due_amount": due_amount,
-            "status": payment_status,
-        },
-        status=status.HTTP_201_CREATED
-    )
+    total = Decimal("0")
 
+    for item in items:
+        product = Product.objects.select_for_update().get(
+            id=item["product_id"], shop=shop
+        )
 
-# -------------------------------------------------
-# DASHBOARD ANALYTICS
-# -------------------------------------------------
-@api_view(['GET'])
-def dashboard_stats(request):
-    today = now().date()
+        qty = Decimal(str(item["quantity"]))
+        if qty <= 0:
+            return Response({"error": "Invalid quantity"}, status=400)
 
-    sales_today = Sale.objects.filter(created_at__date=today)
-    total_sales = sales_today.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
-    total_profit = sales_today.aggregate(Sum('profit'))['profit__sum'] or 0
-    total_due = Sale.objects.filter(payment_status="DUE").aggregate(
-        Sum('due_amount')
-    )['due_amount__sum'] or 0
+        if product.stock < qty:
+            return Response({"error": f"Insufficient stock for {product.name}"}, status=400)
 
-    low_stock = Product.objects.filter(stock__lte=5).values(
-        'id', 'name', 'stock'
-    )
+        rate = product.selling_price
+        line_total = qty * rate
+
+        BillItem.objects.create(
+            bill=bill,
+            product=product,
+            quantity=qty,
+            unit=product.unit,
+            rate=rate,
+            line_total=line_total,
+        )
+
+        product.stock -= qty
+        product.save()
+
+        total += line_total
+
+    bill.total_amount = total
+    bill.due_amount = total - paid_amount
+    bill.save()
 
     return Response({
-        "total_sales": total_sales,
-        "total_profit": total_profit,
-        "total_due": total_due,
-        "low_stock": list(low_stock)
+        "bill_id": bill.id,
+        "total": str(bill.total_amount),
+        "paid": str(bill.paid_amount),
+        "due": str(bill.due_amount),
+    }, status=201)
+
+
+# =================================================
+# PAY BILL DUE (INDIVIDUAL BILL)
+# =================================================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def pay_bill_due(request, bill_id):
+    shop = request.user.shop
+    amount = Decimal(str(request.data.get("amount", "0")))
+
+    if amount <= 0:
+        return Response({"error": "Invalid amount"}, status=400)
+
+    bill = Bill.objects.select_for_update().get(id=bill_id, shop=shop)
+
+    if bill.due_amount <= 0:
+        return Response({"error": "Bill already cleared"}, status=400)
+
+    if amount > bill.due_amount:
+        amount = bill.due_amount
+
+    bill.paid_amount += amount
+    bill.due_amount -= amount
+    bill.save()
+
+    return Response({
+        "message": "Payment successful",
+        "paid": str(bill.paid_amount),
+        "due": str(bill.due_amount),
     })
 
 
-# -------------------------------------------------
-# BILL HISTORY + SEARCH + PAGINATION
-# -------------------------------------------------
-@api_view(['GET'])
+# =================================================
+# DASHBOARD STATS
+# =================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_stats(request):
+    shop = request.user.shop
+    today = now().date()
+
+    total_sales = Bill.objects.filter(
+        shop=shop,
+        created_at__date=today
+    ).aggregate(Sum("total_amount"))["total_amount__sum"] or 0
+
+    total_due = Bill.objects.filter(
+        shop=shop,
+        due_amount__gt=0
+    ).aggregate(Sum("due_amount"))["due_amount__sum"] or 0
+
+    return Response({
+        "total_sales": str(total_sales),
+        "total_due": str(total_due),
+    })
+
+
+# =================================================
+# BILL HISTORY (SEARCH: BILL / CUSTOMER / MOBILE)
+# =================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def bill_history(request):
+    shop = request.user.shop
     search = request.GET.get("search", "")
-    start_date = request.GET.get("start_date")
-    end_date = request.GET.get("end_date")
-    page_number = request.GET.get("page", 1)
+    page_no = request.GET.get("page", 1)
 
-    sales = Sale.objects.select_related(
-        "product", "customer"
-    ).order_by("-created_at")
+    bills = Bill.objects.filter(shop=shop).select_related("customer")
 
-    # Search by customer
     if search:
-        sales = sales.filter(
+        bills = bills.filter(
+            Q(id__icontains=search) |
             Q(customer__name__icontains=search) |
             Q(customer__mobile__icontains=search)
         )
 
-    # Date filter
-    if start_date and end_date:
-        sales = sales.filter(created_at__date__range=[start_date, end_date])
-
-    paginator = Paginator(sales, 10)  # 10 bills per page
-    page = paginator.get_page(page_number)
-
-    data = []
-    for s in page:
-        data.append({
-            "id": s.id,
-            "customer": s.customer.name if s.customer else "Walk-in",
-            "mobile": s.customer.mobile if s.customer else "",
-            "product": s.product.name,
-            "quantity": s.quantity,
-            "total_amount": s.total_amount,
-            "paid_amount": s.paid_amount,
-            "due_amount": s.due_amount,
-            "payment_status": s.payment_status,
-            "created_at": s.created_at.strftime("%d-%m-%Y %H:%M"),
-        })
+    bills = bills.order_by("-created_at")
+    paginator = Paginator(bills, 10)
+    page = paginator.get_page(page_no)
 
     return Response({
-        "results": data,
+        "results": [
+            {
+                "id": b.id,
+                "customer": b.customer.name if b.customer else "Walk-in",
+                "mobile": b.customer.mobile if b.customer else "",
+                "total": str(b.total_amount),
+                "paid": str(b.paid_amount),
+                "due": str(b.due_amount),
+                "date": b.created_at.strftime("%d-%m-%Y"),
+            }
+            for b in page
+        ],
         "total_pages": paginator.num_pages,
-        "current_page": page.number,
+    })
+
+
+# =================================================
+# CUSTOMER LEDGER (ALL BILLS)
+# =================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def customer_ledger(request):
+    shop = request.user.shop
+    search = request.GET.get("search", "")
+
+    customers = Customer.objects.filter(shop=shop)
+    if search:
+        customers = customers.filter(
+            Q(name__icontains=search) |
+            Q(mobile__icontains=search)
+        )
+
+    result = []
+    for c in customers:
+        bills = Bill.objects.filter(shop=shop, customer=c)
+        total_due = bills.aggregate(Sum("due_amount"))["due_amount__sum"] or 0
+
+        result.append({
+            "customer_id": c.id,
+            "customer_name": c.name,
+            "mobile": c.mobile,
+            "total_due": str(total_due),
+            "bills": [
+                {
+                    "bill_id": b.id,
+                    "date": b.created_at.strftime("%d-%m-%Y"),
+                    "total": str(b.total_amount),
+                    "paid": str(b.paid_amount),
+                    "due": str(b.due_amount),
+                }
+                for b in bills
+            ],
+        })
+
+    return Response(result)
+
+
+# =================================================
+# CUSTOMER STATEMENT (PRINT)
+# =================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def customer_statement(request, customer_id):
+    shop = request.user.shop
+    customer = Customer.objects.get(id=customer_id, shop=shop)
+
+    bills = Bill.objects.filter(customer=customer, shop=shop)
+    total_due = bills.aggregate(Sum("due_amount"))["due_amount__sum"] or 0
+
+    return Response({
+        "customer_id": customer.id,
+        "customer_name": customer.name,
+        "mobile": customer.mobile,
+        "total_due": str(total_due),
+        "bills": [
+            {
+                "bill_id": b.id,
+                "date": b.created_at.strftime("%d-%m-%Y"),
+                "total": str(b.total_amount),
+                "paid": str(b.paid_amount),
+                "due": str(b.due_amount),
+            }
+            for b in bills
+        ],
+    })
+
+
+# =================================================
+# SINGLE BILL (PRINT)
+# =================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_bill(request, bill_id):
+    shop = request.user.shop
+    bill = Bill.objects.get(id=bill_id, shop=shop)
+
+    return Response({
+        "id": bill.id,
+        "date": bill.created_at.strftime("%d-%m-%Y %H:%M"),
+        "shop": bill.shop.name,
+        "customer_name": bill.customer.name if bill.customer else "Walk-in",
+        "customer_mobile": bill.customer.mobile if bill.customer else "",
+        "items": [
+            {
+                "name": i.product.name,
+                "qty": float(i.quantity),
+                "unit": i.unit,
+                "rate": float(i.rate),
+                "line_total": float(i.line_total),
+            }
+            for i in bill.items.all()
+        ],
+        "total": float(bill.total_amount),
+        "paid": float(bill.paid_amount),
+        "due": float(bill.due_amount),
     })
